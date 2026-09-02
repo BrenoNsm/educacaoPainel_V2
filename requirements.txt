@@ -1,0 +1,10 @@
+requests
+numpy
+pandas
+openpyxl
+chardet
+xlrd
+psycopg[binary]
+SQLAlchemy
+python-dotenv
+certifi

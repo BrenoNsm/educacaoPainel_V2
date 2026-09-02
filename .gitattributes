@@ -1,0 +1,8 @@
+# Normaliza finais de linha para LF em arquivos de texto
+* text=auto eol=lf
+
+# Shell scripts devem sempre usar LF
+*.sh text eol=lf
+
+# Arquivos Python
+*.py text eol=lf

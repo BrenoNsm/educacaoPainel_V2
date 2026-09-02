@@ -1,0 +1,25 @@
+# Python
+__pycache__
+*.pyc
+.venv
+*.egg-info
+
+# IDE
+.idea
+.vscode
+
+# Dados
+data
+data/extract
+data/indicadores
+data/microDados
+data/microdados
+data/out
+data/raw
+
+# Segredos
+.env
+secrets
+
+# Logs
+logs
