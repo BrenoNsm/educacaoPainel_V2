@@ -1,10 +1,17 @@
 """
 db.py
 Utilitários de persistência em PostgreSQL para o pipeline.
- - Conexão via SQLAlchemy (driver psycopg)
- - Criação de schema (DDL) idempotente
- - Criação de views para manter consistência com os CSVs previamente gerados
- - Helpers de upsert (dimensões) e inserção em lote (fatos)
+Modelo estrela (star schema) para BI.
+
+Dimensões:
+  dim_tempo, dim_localizacao, dim_dependencia, dim_grupo_medida,
+  dim_grupo_infra, dim_categoria_indigena, dim_metrica,
+  dim_tipo_receita, dim_tipo_despesa, dim_municipio, dim_escola
+
+Fatos:
+  fact_censo_medida, fact_infra_escola, fact_indigena,
+  fact_tx_rendimento, fact_siope_receita, fact_siope_despesa,
+  fact_siope_indicadores
 """
 
 from __future__ import annotations
@@ -22,19 +29,166 @@ import config
 _ENGINE = None
 
 
-def get_engine():
-    global _ENGINE
-    if _ENGINE is None:
-        url = (
-            f"postgresql+psycopg://{config.PG_USER}:{config.PG_PASSWORD}"
-            f"@{config.PG_HOST}:{config.PG_PORT}/{config.PG_DATABASE}"
-        )
-        _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
-    return _ENGINE
+# ═══════════════════════════════════════════════════════════════
+# MAPAS DE DOMÍNIO (chave natural → rótulo legível)
+# ═══════════════════════════════════════════════════════════════
 
+REGIOES = {
+    "AC": "Norte", "AM": "Norte", "AP": "Norte", "PA": "Norte",
+    "RO": "Norte", "RR": "Norte", "TO": "Norte",
+    "AL": "Nordeste", "BA": "Nordeste", "CE": "Nordeste",
+    "MA": "Nordeste", "PB": "Nordeste", "PE": "Nordeste",
+    "PI": "Nordeste", "RN": "Nordeste", "SE": "Nordeste",
+    "DF": "Centro-Oeste", "GO": "Centro-Oeste", "MS": "Centro-Oeste", "MT": "Centro-Oeste",
+    "ES": "Sudeste", "MG": "Sudeste", "RJ": "Sudeste", "SP": "Sudeste",
+    "PR": "Sul", "RS": "Sul", "SC": "Sul",
+}
+
+DEPENDENCIA_MAP = {
+    "1": ("1", "Federal"), "FEDERAL": ("1", "Federal"),
+    "2": ("2", "Estadual"), "ESTADUAL": ("2", "Estadual"), "ESTADO": ("2", "Estadual"),
+    "3": ("3", "Municipal"), "MUNICIPAL": ("3", "Municipal"), "MUNICÍPAL": ("3", "Municipal"),
+    "4": ("4", "Privada"), "PRIVADA": ("4", "Privada"), "PARTICULAR": ("4", "Privada"),
+}
+
+LOCALIZACAO_MAP = {
+    "1": ("1", "Urbana"), "URBANA": ("1", "Urbana"), "URBANO": ("1", "Urbana"),
+    "2": ("2", "Rural"), "RURAL": ("2", "Rural"),
+}
+
+GRUPOS_MEDIDA_SEED = [
+    ("Matrículas", "Educação Especial"),
+    ("Matrículas", "Ed. Infantil - Creche"),
+    ("Matrículas", "Ed. Infantil - Pré-Escola"),
+    ("Matrículas", "Ensino Fund. - Anos Iniciais"),
+    ("Matrículas", "Ensino Fund. - Anos Finais"),
+    ("Matrículas", "Ensino Médio"),
+    ("Matrículas", "EJA - Ensino Fundamental"),
+    ("Matrículas", "EJA - Ensino Médio"),
+    ("Matrículas - Tempo Integral", "Ed. Infantil - Creche"),
+    ("Matrículas - Tempo Integral", "Ed. Infantil - Pré-Escola"),
+    ("Matrículas - Tempo Integral", "Ensino Fund. - Anos Iniciais"),
+    ("Matrículas - Tempo Integral", "Ensino Fund. - Anos Finais"),
+    ("Matrículas - Tempo Integral", "Ensino Médio"),
+    ("Turmas", "Educação Especial"),
+    ("Turmas", "Ed. Infantil - Creche"),
+    ("Turmas", "Ed. Infantil - Pré-Escola"),
+    ("Turmas", "Ensino Fund. - Anos Iniciais"),
+    ("Turmas", "Ensino Fund. - Anos Finais"),
+    ("Turmas", "Ensino Médio"),
+    ("Turmas", "EJA - Ensino Fundamental"),
+    ("Turmas", "EJA - Ensino Médio"),
+    ("Docentes", "Educação Básica (Total)"),
+    ("Docentes", "Educação Especial"),
+    ("Docentes", "Ed. Infantil - Creche"),
+    ("Docentes", "Ed. Infantil - Pré-Escola"),
+    ("Docentes", "Ensino Fund. - Anos Iniciais"),
+    ("Docentes", "Ensino Fund. - Anos Finais"),
+    ("Docentes", "Ensino Médio"),
+    ("Docentes", "EJA - Ensino Fundamental"),
+    ("Docentes", "EJA - Ensino Médio"),
+    ("Docentes (Estimado)", "Educação Especial"),
+    ("Docentes (Estimado)", "Ed. Infantil - Creche"),
+    ("Docentes (Estimado)", "Ed. Infantil - Pré-Escola"),
+    ("Docentes (Estimado)", "Ensino Fund. - Anos Iniciais"),
+    ("Docentes (Estimado)", "Ensino Fund. - Anos Finais"),
+    ("Docentes (Estimado)", "Ensino Médio"),
+    ("Docentes (Estimado)", "EJA - Ensino Fundamental"),
+    ("Docentes (Estimado)", "EJA - Ensino Médio"),
+    ("Escolas", "Todas"),
+    ("Matrículas Indígenas (Total)", "Todas"),
+    ("Matrículas Indígenas (Etapas)", "Educação Especial"),
+    ("Matrículas Indígenas (Etapas)", "Ed. Infantil - Creche"),
+    ("Matrículas Indígenas (Etapas)", "Ed. Infantil - Pré-Escola"),
+    ("Matrículas Indígenas (Etapas)", "Ensino Fund. - Anos Iniciais"),
+    ("Matrículas Indígenas (Etapas)", "Ensino Fund. - Anos Finais"),
+    ("Matrículas Indígenas (Etapas)", "Ensino Médio"),
+    ("Matrículas Indígenas (Etapas)", "EJA - Ensino Fundamental"),
+    ("Matrículas Indígenas (Etapas)", "EJA - Ensino Médio"),
+    ("Matrículas Indígenas (Etapas)", "Não detalhado"),
+    ("Matrículas (GERAL)", "Educação Especial"),
+    ("Matrículas (GERAL)", "Ed. Infantil - Creche"),
+    ("Matrículas (GERAL)", "Ed. Infantil - Pré-Escola"),
+    ("Matrículas (GERAL)", "Ensino Fund. - Anos Iniciais"),
+    ("Matrículas (GERAL)", "Ensino Fund. - Anos Finais"),
+    ("Matrículas (GERAL)", "Ensino Médio"),
+    ("Matrículas (GERAL)", "EJA - Ensino Fundamental"),
+    ("Matrículas (GERAL)", "EJA - Ensino Médio"),
+]
+
+GRUPOS_INFRA_SEED = [
+    "Água", "Energia", "Esgoto", "Lixo",
+    "Internet/TIC", "Dependências", "Acessibilidade", "Outros",
+]
+
+CATEGORIAS_INDIGENA_SEED = [
+    "Escola Indígena", "Em Terra Indígena", "Com Língua Indígena", "Não indígena",
+]
+
+METRICAS_RENDIMENTO_SEED = [
+    "Taxa de Aprovação", "Taxa de Reprovação", "Taxa de Abandono",
+]
+
+TIPOS_RECEITA_SEED = [
+    ("RECEITA_ORCAMENTARIA", "Receita Orçamentária", "Receita"),
+    ("RECEITA_REALIZADA", "Receita Realizada", "Receita"),
+    ("RECEITA_PREVISTA_ATUALIZADA", "Receita Prevista Atualizada", "Receita"),
+    ("FPM", "Fundo de Partilha do Minas", "Transferência"),
+    ("FPE", "Fundo de Participação dos Estados", "Transferência"),
+    ("ITR", "Imposto Territorial Rural", "Imposto"),
+    ("ICMS", "ICMS", "Imposto"),
+    ("IPI_EXPORTACAO", "IPI de Exportação", "Imposto"),
+    ("CIDE", "CIDE", "Imposto"),
+    ("FUNDEB", "FUNDEB", "FUNDEB"),
+    ("CP_FUNDEB", "Cota-Parte FUNDEB", "FUNDEB"),
+    ("IPVA_FUNDEB", "IPVA para FUNDEB", "FUNDEB"),
+    ("ITCMD_FUNDEB", "ITCMD para FUNDEB", "FUNDEB"),
+    ("TRANSMISSAO", "Transmissão", "Receita"),
+]
+
+TIPOS_DESPESA_SEED = [
+    ("GERAL_ORCAMENTARIA", "Despesa Orçamentária", "Geral"),
+    ("GERAL_DOTACAO_ATUALIZADA", "Despesa Dotação Atualizada", "Geral"),
+    ("GERAL_EMPENHADA", "Despesa Empenhada", "Geral"),
+    ("GERAL_LIQUIDADA", "Despesa Liquidada", "Geral"),
+    ("GERAL_PAGA", "Despesa Paga", "Geral"),
+    ("EDU_ORCAMENTARIA", "Despesa Orçamentária Educação", "Educação"),
+    ("EDU_DOTACAO_ATUALIZADA", "Despesa Dotação Atualizada Educação", "Educação"),
+    ("EDU_EMPENHADA", "Despesa Empenhada Educação", "Educação"),
+    ("EDU_LIQUIDADA", "Despesa Liquidada Educação", "Educação"),
+    ("EDU_PAGA", "Despesa Paga Educação", "Educação"),
+]
+
+SIOPE_RECEITA_KEYS = {
+    "VAL_RECE_ORCA": "RECEITA_ORCAMENTARIA",
+    "VAL_RECE_REAL": "RECEITA_REALIZADA",
+    "VAL_RECE_PREV_ATUA": "RECEITA_PREVISTA_ATUALIZADA",
+    "NUM_FPM": "FPM", "NUM_FPE": "FPE", "NUM_ITR": "ITR",
+    "NUM_ICMS": "ICMS", "NUM_IPI_EXPO": "IPI_EXPORTACAO",
+    "NUM_CIDE": "CIDE", "NUM_FUNDEF": "FUNDEB",
+    "NUM_CP_FUNDEF": "CP_FUNDEB", "NUM_IPVA_FUNDEB": "IPVA_FUNDEB",
+    "NUM_ITCMD_FUNDEB": "ITCMD_FUNDEB", "VAL_TRANSMISSAO": "TRANSMISSAO",
+}
+
+SIOPE_DESPESA_KEYS = {
+    "VAL_DESP_ORCA": "GERAL_ORCAMENTARIA",
+    "VAL_DESP_DOTA_ATUA": "GERAL_DOTACAO_ATUALIZADA",
+    "VAL_DESP_EMPE": "GERAL_EMPENHADA",
+    "VAL_DESP_LIQU": "GERAL_LIQUIDADA",
+    "VAL_DESP_PAGA": "GERAL_PAGA",
+    "VL_DESP_ORCA_EDU": "EDU_ORCAMENTARIA",
+    "VL_DESP_DOTA_ATUA_EDU": "EDU_DOTACAO_ATUALIZADA",
+    "VL_DESP_EMPE_EDU": "EDU_EMPENHADA",
+    "VL_DESP_LIQU_EDU": "EDU_LIQUIDADA",
+    "VL_DESP_PAGA_EDU": "EDU_PAGA",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITÁRIOS
+# ═══════════════════════════════════════════════════════════════
 
 def _to_int_or_none(v):
-    """Converte valores como '2', '2.0', 2.0 para int; vazio/NaN vira None."""
     if v is None:
         return None
     try:
@@ -70,22 +224,46 @@ def _to_float_or_none(v):
         return None
 
 
+def _s(v):
+    """Converte para string, None se vazio/NaN."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, float) and math.isnan(v):
+            return None
+    except Exception:
+        pass
+    s = str(v).strip()
+    return s if s != "" and s.lower() != "nan" else None
+
+
+def _i(v):
+    """Converte para int, None se vazio/NaN."""
+    return _to_int_or_none(v)
+
+
+def _get(row, *candidates):
+    """Busca o primeiro valor não-nulo entre nomes de coluna candidatos."""
+    for c in candidates:
+        if c in row.index:
+            v = row[c]
+            if pd.notna(v):
+                return v
+    return None
+
+
 def _exec_batch(conn, sql, rows: Sequence, chunk: int = 5000):
-    """Execute bateladas com SQLAlchemy 2.0.
-    Aceita lista de dicts OU lista de sequências; no segundo caso,
-    converte para dicts mapeando índices para nomes ':0', ':1', ...
-    """
+    """Execute bateladas com SQLAlchemy 2.0."""
     if not rows:
         return
     total = len(rows)
     try:
-        # aceita string ou TextClause/Executable
         from sqlalchemy.sql.elements import TextClause
         stmt = sql if isinstance(sql, TextClause) else text(sql)
     except Exception:
         stmt = text(sql)
     for i in range(0, total, chunk):
-        part = rows[i : i + chunk]
+        part = rows[i: i + chunk]
         if part and not isinstance(part[0], dict):
             dicts = []
             for row in part:
@@ -96,117 +274,128 @@ def _exec_batch(conn, sql, rows: Sequence, chunk: int = 5000):
         conn.execute(stmt, dicts)
 
 
+# ═══════════════════════════════════════════════════════════════
+# ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def get_engine():
+    global _ENGINE
+    if _ENGINE is None:
+        url = (
+            f"postgresql+psycopg://{config.PG_USER}:{config.PG_PASSWORD}"
+            f"@{config.PG_HOST}:{config.PG_PORT}/{config.PG_DATABASE}"
+        )
+        _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
+    return _ENGINE
+
+
+# ═══════════════════════════════════════════════════════════════
+# DDL (IDEMPOTENTE)
+# ═══════════════════════════════════════════════════════════════
+
 def init_db():
-    """Cria tabelas e views (idempotente)."""
+    """Cria todas as tabelas, popula dimensões seed e cria views."""
     eng = get_engine()
     with eng.begin() as conn:
-        # Tabelas de dimensão
-        conn.execute(text(
-            """
+
+        # ── DIMENSÕES ──────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_tempo (
+                sk_tempo  SERIAL PRIMARY KEY,
+                ano       INT NOT NULL UNIQUE
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_localizacao (
+                sk_localizacao  SERIAL PRIMARY KEY,
+                cod_localizacao TEXT NOT NULL UNIQUE,
+                descricao       TEXT NOT NULL
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_dependencia (
+                sk_dependencia  SERIAL PRIMARY KEY,
+                cod_dependencia TEXT NOT NULL UNIQUE,
+                descricao       TEXT NOT NULL
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_grupo_medida (
+                sk_grupo_medida SERIAL PRIMARY KEY,
+                grupo           TEXT NOT NULL,
+                etapa           TEXT NOT NULL,
+                UNIQUE(grupo, etapa)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_grupo_infra (
+                sk_grupo_infra SERIAL PRIMARY KEY,
+                grupo_infra    TEXT NOT NULL UNIQUE
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_categoria_indigena (
+                sk_categoria_indigena SERIAL PRIMARY KEY,
+                categoria             TEXT NOT NULL UNIQUE
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_metrica (
+                sk_metrica SERIAL PRIMARY KEY,
+                metrica    TEXT NOT NULL UNIQUE
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_tipo_receita (
+                sk_tipo_receita SERIAL PRIMARY KEY,
+                cod_receita     TEXT NOT NULL UNIQUE,
+                descricao       TEXT,
+                categoria       TEXT
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_tipo_despesa (
+                sk_tipo_despesa SERIAL PRIMARY KEY,
+                cod_despesa     TEXT NOT NULL UNIQUE,
+                descricao       TEXT,
+                categoria       TEXT
+            );
+        """))
+
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dim_municipio (
                 cod_municipio TEXT PRIMARY KEY,
                 nome          TEXT,
-                uf            TEXT
+                uf            TEXT,
+                regiao        TEXT
             );
-            """
-        ))
+        """))
 
-        conn.execute(text(
-            """
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dim_escola (
                 cod_escola     TEXT PRIMARY KEY,
                 nome           TEXT,
-                cod_municipio  TEXT REFERENCES dim_municipio(cod_municipio)
+                cod_municipio  TEXT REFERENCES dim_municipio(cod_municipio),
+                sk_dependencia INT REFERENCES dim_dependencia(sk_dependencia),
+                sk_localizacao INT REFERENCES dim_localizacao(sk_localizacao)
             );
-            """
-        ))
+        """))
 
-        # Fatos (inclui colunas necessárias para views consistentes com os CSVs)
-        conn.execute(text(
-            """
-            CREATE TABLE IF NOT EXISTS fact_censo_medida (
-                ano             INT,
-                uf              TEXT,
-                cod_municipio   TEXT,
-                nome_municipio  TEXT,
-                tp_dependencia  TEXT,
-                tp_localizacao  TEXT,
-                cod_escola      TEXT,
-                nome_escola     TEXT,
-                grupo           TEXT,
-                etapa           TEXT,
-                qt              INT,
-                CONSTRAINT pk_fact_censo_medida UNIQUE (ano, cod_escola, grupo, etapa)
-            );
-            """
-        ))
+        # Índices para dim_escola
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_dim_escola_municipio ON dim_escola(cod_municipio);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_dim_escola_depend   ON dim_escola(sk_dependencia);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_dim_escola_local    ON dim_escola(sk_localizacao);"))
 
-        conn.execute(text(
-            """
-            CREATE TABLE IF NOT EXISTS fact_infra_escola (
-                ano               INT,
-                uf                TEXT,
-                cod_municipio     TEXT,
-                nome_municipio    TEXT,
-                tp_dependencia    TEXT,
-                rede_tipo         TEXT,
-                tp_localizacao    TEXT,
-                localizacao_tipo  TEXT,
-                cod_escola        TEXT,
-                nome_escola       TEXT,
-                grupo_infra       TEXT,
-                item              TEXT,
-                possui            INT,
-                CONSTRAINT pk_fact_infra_escola UNIQUE (ano, cod_escola, item)
-            );
-            """
-        ))
-
-        conn.execute(text(
-            """
-            CREATE TABLE IF NOT EXISTS fact_indigena (
-                ano             INT,
-                uf              TEXT,
-                cod_municipio   TEXT,
-                nome_municipio  TEXT,
-                tp_dependencia  TEXT,
-                tp_localizacao  TEXT,
-                cod_escola      TEXT,
-                nome_escola     TEXT,
-                categoria       TEXT,
-                grupo           TEXT,
-                etapa           TEXT,
-                qt              INT,
-                CONSTRAINT pk_fact_indigena UNIQUE (ano, cod_escola, categoria, grupo, etapa)
-            );
-            """
-        ))
-
-        conn.execute(text(
-            """
-            CREATE TABLE IF NOT EXISTS fact_tx_rendimento (
-                ano                 INT,
-                regiao              TEXT,
-                uf                  TEXT,
-                cod_municipio       TEXT,
-                nome_municipio      TEXT,
-                cod_escola          TEXT,
-                nome_escola         TEXT,
-                localizacao         TEXT,
-                dependencia         TEXT,
-                etapa               TEXT,
-                serie               INT,
-                metrica             TEXT,
-                valor               TEXT,
-                valor_num           DOUBLE PRECISION,
-                valor_prop          DOUBLE PRECISION,
-                CONSTRAINT pk_fact_tx_rendimento UNIQUE (ano, uf, cod_municipio, cod_escola, etapa, serie, metrica)
-            );
-            """
-        ))
-
-        conn.execute(text(
-            """
+        # ── FATOS ──────────────────────────────────────────────
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS siope_registro_raw (
                 id             BIGSERIAL PRIMARY KEY,
                 num_ano        INT,
@@ -216,280 +405,628 @@ def init_db():
                 periodo_label  TEXT,
                 payload        JSONB
             );
-            """
-        ))
+        """))
 
-        # Views que refletem os CSVs anteriores (nomes/ordem de colunas)
-        conn.execute(text(
-            """
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_censo_medida (
+                sk_tempo        INT REFERENCES dim_tempo(sk_tempo),
+                cod_escola      TEXT REFERENCES dim_escola(cod_escola),
+                sk_grupo_medida INT REFERENCES dim_grupo_medida(sk_grupo_medida),
+                qt              INT,
+                PRIMARY KEY(sk_tempo, cod_escola, sk_grupo_medida)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_infra_escola (
+                sk_tempo       INT REFERENCES dim_tempo(sk_tempo),
+                cod_escola     TEXT REFERENCES dim_escola(cod_escola),
+                sk_grupo_infra INT REFERENCES dim_grupo_infra(sk_grupo_infra),
+                item           TEXT,
+                possui         INT,
+                PRIMARY KEY(sk_tempo, cod_escola, item)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_indigena (
+                sk_tempo              INT REFERENCES dim_tempo(sk_tempo),
+                cod_escola            TEXT REFERENCES dim_escola(cod_escola),
+                sk_categoria_indigena INT REFERENCES dim_categoria_indigena(sk_categoria_indigena),
+                sk_grupo_medida       INT REFERENCES dim_grupo_medida(sk_grupo_medida),
+                qt                    INT,
+                PRIMARY KEY(sk_tempo, cod_escola, sk_categoria_indigena, sk_grupo_medida)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_tx_rendimento (
+                sk_tempo      INT REFERENCES dim_tempo(sk_tempo),
+                cod_municipio TEXT REFERENCES dim_municipio(cod_municipio),
+                cod_escola    TEXT,
+                sk_metrica    INT REFERENCES dim_metrica(sk_metrica),
+                etapa         TEXT,
+                serie         INT,
+                valor         TEXT,
+                valor_num     DOUBLE PRECISION,
+                valor_prop    DOUBLE PRECISION,
+                PRIMARY KEY(sk_tempo, cod_municipio, cod_escola, sk_metrica, etapa, serie)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_siope_receita (
+                sk_tempo        INT REFERENCES dim_tempo(sk_tempo),
+                cod_municipio   TEXT REFERENCES dim_municipio(cod_municipio),
+                sk_tipo_receita INT REFERENCES dim_tipo_receita(sk_tipo_receita),
+                valor           NUMERIC,
+                PRIMARY KEY(sk_tempo, cod_municipio, sk_tipo_receita)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_siope_despesa (
+                sk_tempo        INT REFERENCES dim_tempo(sk_tempo),
+                cod_municipio   TEXT REFERENCES dim_municipio(cod_municipio),
+                sk_tipo_despesa INT REFERENCES dim_tipo_despesa(sk_tipo_despesa),
+                valor           NUMERIC,
+                PRIMARY KEY(sk_tempo, cod_municipio, sk_tipo_despesa)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_siope_indicadores (
+                sk_tempo           INT REFERENCES dim_tempo(sk_tempo),
+                cod_municipio      TEXT REFERENCES dim_municipio(cod_municipio),
+                populacao          NUMERIC,
+                valor_pib          NUMERIC,
+                valor_pib_percapto NUMERIC,
+                PRIMARY KEY(sk_tempo, cod_municipio)
+            );
+        """))
+
+        # ── ÍNDICES AUXILIARES ─────────────────────────────────
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_censo_escola   ON fact_censo_medida(cod_escola);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_censo_tempo    ON fact_censo_medida(sk_tempo);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_infra_escola  ON fact_infra_escola(cod_escola);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_indig_escola  ON fact_indigena(cod_escola);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_rend_escola   ON fact_tx_rendimento(cod_escola);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_rend_mun     ON fact_tx_rendimento(cod_municipio);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_siope_rec_mun ON fact_siope_receita(cod_municipio);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_siope_des_mun ON fact_siope_despesa(cod_municipio);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_siope_ind_mun ON fact_siope_indicadores(cod_municipio);"))
+
+        # ── SEED DIMENSÕES ─────────────────────────────────────
+        for cod, desc in [("1", "Urbana"), ("2", "Rural")]:
+            conn.execute(text(
+                "INSERT INTO dim_localizacao (cod_localizacao, descricao) VALUES (:c, :d) "
+                "ON CONFLICT (cod_localizacao) DO NOTHING"
+            ), {"c": cod, "d": desc})
+
+        for cod, desc in [("1", "Federal"), ("2", "Estadual"), ("3", "Municipal"), ("4", "Privada")]:
+            conn.execute(text(
+                "INSERT INTO dim_dependencia (cod_dependencia, descricao) VALUES (:c, :d) "
+                "ON CONFLICT (cod_dependencia) DO NOTHING"
+            ), {"c": cod, "d": desc})
+
+        for grupo, etapa in GRUPOS_MEDIDA_SEED:
+            conn.execute(text(
+                "INSERT INTO dim_grupo_medida (grupo, etapa) VALUES (:g, :e) "
+                "ON CONFLICT (grupo, etapa) DO NOTHING"
+            ), {"g": grupo, "e": etapa})
+
+        for nome in GRUPOS_INFRA_SEED:
+            conn.execute(text(
+                "INSERT INTO dim_grupo_infra (grupo_infra) VALUES (:n) "
+                "ON CONFLICT (grupo_infra) DO NOTHING"
+            ), {"n": nome})
+
+        for cat in CATEGORIAS_INDIGENA_SEED:
+            conn.execute(text(
+                "INSERT INTO dim_categoria_indigena (categoria) VALUES (:c) "
+                "ON CONFLICT (categoria) DO NOTHING"
+            ), {"c": cat})
+
+        for met in METRICAS_RENDIMENTO_SEED:
+            conn.execute(text(
+                "INSERT INTO dim_metrica (metrica) VALUES (:m) "
+                "ON CONFLICT (metrica) DO NOTHING"
+            ), {"m": met})
+
+        for cod, desc, cat in TIPOS_RECEITA_SEED:
+            conn.execute(text(
+                "INSERT INTO dim_tipo_receita (cod_receita, descricao, categoria) "
+                "VALUES (:c, :d, :cat) ON CONFLICT (cod_receita) DO NOTHING"
+            ), {"c": cod, "d": desc, "cat": cat})
+
+        for cod, desc, cat in TIPOS_DESPESA_SEED:
+            conn.execute(text(
+                "INSERT INTO dim_tipo_despesa (cod_despesa, descricao, categoria) "
+                "VALUES (:c, :d, :cat) ON CONFLICT (cod_despesa) DO NOTHING"
+            ), {"c": cod, "d": desc, "cat": cat})
+
+        # ── VIEWS (MODELO ESTRELA PARA BI) ─────────────────────
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_censo AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                e.cod_escola, e.nome AS nome_escola,
+                d.descricao AS dependencia, l.descricao AS localizacao,
+                gm.grupo, gm.etapa,
+                f.qt
+            FROM fact_censo_medida f
+            JOIN dim_tempo t           ON f.sk_tempo = t.sk_tempo
+            JOIN dim_escola e          ON f.cod_escola = e.cod_escola
+            JOIN dim_municipio m       ON e.cod_municipio = m.cod_municipio
+            JOIN dim_grupo_medida gm   ON f.sk_grupo_medida = gm.sk_grupo_medida
+            JOIN dim_dependencia d     ON e.sk_dependencia = d.sk_dependencia
+            JOIN dim_localizacao l     ON e.sk_localizacao = l.sk_localizacao;
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_infra AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                e.cod_escola, e.nome AS nome_escola,
+                d.descricao AS dependencia, l.descricao AS localizacao,
+                gi.grupo_infra, f.item, f.possui
+            FROM fact_infra_escola f
+            JOIN dim_tempo t           ON f.sk_tempo = t.sk_tempo
+            JOIN dim_escola e          ON f.cod_escola = e.cod_escola
+            JOIN dim_municipio m       ON e.cod_municipio = m.cod_municipio
+            JOIN dim_grupo_infra gi    ON f.sk_grupo_infra = gi.sk_grupo_infra
+            JOIN dim_dependencia d     ON e.sk_dependencia = d.sk_dependencia
+            JOIN dim_localizacao l     ON e.sk_localizacao = l.sk_localizacao;
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_indigena AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                e.cod_escola, e.nome AS nome_escola,
+                d.descricao AS dependencia, l.descricao AS localizacao,
+                ci.categoria, gm.grupo, gm.etapa,
+                f.qt
+            FROM fact_indigena f
+            JOIN dim_tempo t              ON f.sk_tempo = t.sk_tempo
+            JOIN dim_escola e             ON f.cod_escola = e.cod_escola
+            JOIN dim_municipio m          ON e.cod_municipio = m.cod_municipio
+            JOIN dim_categoria_indigena ci ON f.sk_categoria_indigena = ci.sk_categoria_indigena
+            JOIN dim_grupo_medida gm      ON f.sk_grupo_medida = gm.sk_grupo_medida
+            JOIN dim_dependencia d        ON e.sk_dependencia = d.sk_dependencia
+            JOIN dim_localizacao l        ON e.sk_localizacao = l.sk_localizacao;
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_rendimento AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                f.cod_escola,
+                me.metrica, f.etapa, f.serie,
+                f.valor, f.valor_num, f.valor_prop
+            FROM fact_tx_rendimento f
+            JOIN dim_tempo t      ON f.sk_tempo = t.sk_tempo
+            JOIN dim_municipio m  ON f.cod_municipio = m.cod_municipio
+            JOIN dim_metrica me   ON f.sk_metrica = me.sk_metrica;
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_siope_receita AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                tr.cod_receita, tr.descricao AS tipo_receita, tr.categoria AS categoria_receita,
+                f.valor
+            FROM fact_siope_receita f
+            JOIN dim_tempo t         ON f.sk_tempo = t.sk_tempo
+            JOIN dim_municipio m     ON f.cod_municipio = m.cod_municipio
+            JOIN dim_tipo_receita tr ON f.sk_tipo_receita = tr.sk_tipo_receita;
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_siope_despesa AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                td.cod_despesa, td.descricao AS tipo_despesa, td.categoria AS categoria_despesa,
+                f.valor
+            FROM fact_siope_despesa f
+            JOIN dim_tempo t         ON f.sk_tempo = t.sk_tempo
+            JOIN dim_municipio m     ON f.cod_municipio = m.cod_municipio
+            JOIN dim_tipo_despesa td ON f.sk_tipo_despesa = td.sk_tipo_despesa;
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW vw_fact_siope_indicadores AS
+            SELECT
+                t.ano,
+                m.cod_municipio, m.nome AS nome_municipio, m.uf, m.regiao,
+                f.populacao, f.valor_pib, f.valor_pib_percapto
+            FROM fact_siope_indicadores f
+            JOIN dim_tempo t     ON f.sk_tempo = t.sk_tempo
+            JOIN dim_municipio m ON f.cod_municipio = m.cod_municipio;
+        """))
+
+        # Views de compatibilidade com nomes CSV antigos
+        conn.execute(text("""
             CREATE OR REPLACE VIEW vw_dados_normalizados_por_etapa AS
-            SELECT
-                ano            AS "NU_ANO_CENSO",
-                uf             AS "SG_UF",
-                cod_municipio  AS "CO_MUNICIPIO",
-                nome_municipio AS "NO_MUNICIPIO",
-                tp_dependencia AS "TP_DEPENDENCIA",
-                tp_localizacao AS "TP_LOCALIZACAO",
-                cod_escola     AS "CO_ENTIDADE",
-                nome_escola    AS "NO_ENTIDADE",
-                grupo          AS "Grupo",
-                etapa          AS "Etapa",
-                qt             AS "QT"
-            FROM fact_censo_medida;
-            """
-        ))
+            SELECT ano, uf, cod_municipio, nome_municipio, dependencia AS tp_dependencia,
+                   localizacao AS tp_localizacao, cod_escola, nome_escola,
+                   grupo, etapa, qt
+            FROM vw_fact_censo;
+        """))
 
-        conn.execute(text(
-            """
+        conn.execute(text("""
             CREATE OR REPLACE VIEW vw_infra_escola_long AS
-            SELECT
-                ano              AS "NU_ANO_CENSO",
-                uf               AS "SG_UF",
-                cod_municipio    AS "CO_MUNICIPIO",
-                nome_municipio   AS "NO_MUNICIPIO",
-                tp_dependencia   AS "TP_DEPENDENCIA",
-                rede_tipo        AS "REDE_TIPO",
-                tp_localizacao   AS "TP_LOCALIZACAO",
-                localizacao_tipo AS "LOCALIZACAO_TIPO",
-                cod_escola       AS "CO_ENTIDADE",
-                nome_escola      AS "NO_ENTIDADE",
-                grupo_infra      AS "GrupoInfra",
-                item             AS "Item",
-                possui           AS "POSSUI"
-            FROM fact_infra_escola;
-            """
-        ))
+            SELECT ano, uf, cod_municipio, nome_municipio, dependencia AS tp_dependencia,
+                   localizacao AS tp_localizacao, cod_escola, nome_escola,
+                   grupo_infra AS "GrupoInfra", item AS "Item", possui AS "POSSUI"
+            FROM vw_fact_infra;
+        """))
 
-        conn.execute(text(
-            """
+        conn.execute(text("""
             CREATE OR REPLACE VIEW vw_dados_indigena_normalizado AS
-            SELECT
-                ano            AS "NU_ANO_CENSO",
-                uf             AS "SG_UF",
-                cod_municipio  AS "CO_MUNICIPIO",
-                nome_municipio AS "NO_MUNICIPIO",
-                tp_dependencia AS "TP_DEPENDENCIA",
-                tp_localizacao AS "TP_LOCALIZACAO",
-                cod_escola     AS "CO_ENTIDADE",
-                nome_escola    AS "NO_ENTIDADE",
-                categoria      AS "CategoriaIndigena",
-                grupo          AS "Grupo",
-                etapa          AS "Etapa",
-                qt             AS "QT"
-            FROM fact_indigena;
-            """
-        ))
+            SELECT ano, uf, cod_municipio, nome_municipio, dependencia AS tp_dependencia,
+                   localizacao AS tp_localizacao, cod_escola, nome_escola,
+                   categoria AS "CategoriaIndigena", grupo, etapa, qt
+            FROM vw_fact_indigena;
+        """))
 
-        conn.execute(text(
-            """
+        conn.execute(text("""
             CREATE OR REPLACE VIEW vw_tx_rendimento_long AS
-            SELECT
-                ano                AS "Ano",
-                regiao             AS "Região",
-                uf                 AS "UF",
-                cod_municipio      AS "Código do Município",
-                nome_municipio     AS "Nome do Município",
-                cod_escola         AS "Código da Escola",
-                nome_escola        AS "Nome da Escola",
-                localizacao        AS "Localização",
-                dependencia        AS "Dependência Administrativa",
-                etapa              AS "Etapa",
-                serie              AS "Serie",
-                metrica            AS "Métrica",
-                valor              AS "Valor",
-                valor_num          AS "Valor_num",
-                valor_prop         AS "Valor_prop"
-            FROM fact_tx_rendimento;
-            """
-        ))
+            SELECT t.ano, m.regiao AS "Região", m.uf, m.cod_municipio AS "Código do Município",
+                   m.nome AS "Nome do Município", r.cod_escola AS "Código da Escola",
+                   r.etapa AS "Etapa", r.serie AS "Serie",
+                   me.metrica AS "Métrica", r.valor AS "Valor",
+                   r.valor_num AS "Valor_num", r.valor_prop AS "Valor_prop"
+            FROM fact_tx_rendimento r
+            JOIN dim_tempo t    ON r.sk_tempo = t.sk_tempo
+            JOIN dim_municipio m ON r.cod_municipio = m.cod_municipio
+            JOIN dim_metrica me ON r.sk_metrica = me.sk_metrica;
+        """))
 
-        # 5. NOVA VIEW: SIOPE ORGANIZADO (EXPLODINDO O JSONB)
         conn.execute(text("""
             CREATE OR REPLACE VIEW vw_siope_detalhado AS
-            SELECT 
-                -- Colunas da Tabela
-                id,
-                num_ano,
-                num_peri,
-                sig_uf,
-                cod_muni,
-                periodo_label,
-                
-                -- Identificação e Localização (JSON)
-                payload->>'TIPO' AS tipo_ente,
-                payload->>'NOM_MUNI' AS nome_municipio,
-                payload->>'SIG_UF' AS uf_payload,
-                (payload->>'COD_UF')::INT AS cod_uf,
-                (payload->>'COD_MUNI')::NUMERIC AS cod_muni_payload,
-                
-                -- Datas e Status
-                payload->>'DAT_DECL' AS data_declaracao,
-                payload->>'IDN_DECL_RETI' AS ind_declaracao_retificadora,
-                payload->>'IDN_TIPO_DECL' AS tipo_declaracao,
-                payload->>'DS_JUST_RETIFICACAO' AS justificativa_retificacao,
-                
-                -- População e PIB
-                (payload->>'NUM_POPU')::NUMERIC AS populacao,
-                (payload->>'VAL_PIB')::NUMERIC AS valor_pib,
-                (payload->>'VAL_PIB_PERCAPTO')::NUMERIC AS valor_pib_percapto,
-                
-                -- Receitas (Geral e Fundeb)
-                (payload->>'VAL_RECE_ORCA')::NUMERIC AS valor_receita_orcamentaria,
-                (payload->>'VAL_RECE_REAL')::NUMERIC AS valor_receita_realizada,
-                (payload->>'VAL_RECE_PREV_ATUA')::NUMERIC AS valor_receita_prevista_atualizada,
-                (payload->>'NUM_FPM')::NUMERIC AS valor_fpm,
-                (payload->>'NUM_FPE')::NUMERIC AS valor_fpe,
-                (payload->>'NUM_ITR')::NUMERIC AS valor_itr,
-                (payload->>'NUM_ICMS')::NUMERIC AS valor_icms,
-                (payload->>'NUM_IPI_EXPO')::NUMERIC AS valor_ipi_exportacao,
-                (payload->>'NUM_CIDE')::NUMERIC AS valor_cide,
-                (payload->>'NUM_FUNDEF')::NUMERIC AS valor_fundeb,
-                (payload->>'NUM_CP_FUNDEF')::NUMERIC AS valor_cp_fundeb,
-                (payload->>'NUM_IPVA_FUNDEB')::NUMERIC AS valor_ipva_fundeb,
-                (payload->>'NUM_ITCMD_FUNDEB')::NUMERIC AS valor_itcmd_fundeb,
-                (payload->>'VAL_TRANSMISSAO')::NUMERIC AS valor_transmissao,
-                
-                -- Despesas Gerais (Dotação, Empenhado, Liquidado, Pago)
-                (payload->>'VAL_DESP_ORCA')::NUMERIC AS valor_despesa_orcamentaria,
-                (payload->>'VAL_DESP_DOTA_ATUA')::NUMERIC AS valor_despesa_dotacao_atualizada,
-                (payload->>'VAL_DESP_EMPE')::NUMERIC AS valor_despesa_empenhada,
-                (payload->>'VAL_DESP_LIQU')::NUMERIC AS valor_despesa_liquidada,
-                (payload->>'VAL_DESP_PAGA')::NUMERIC AS valor_despesa_paga,
-                
-                -- Despesas Específicas de EDUCAÇÃO
-                (payload->>'VL_DESP_ORCA_EDU')::NUMERIC AS valor_despesa_orcamentaria_edu,
-                (payload->>'VL_DESP_DOTA_ATUA_EDU')::NUMERIC AS valor_despesa_dotacao_atualizada_edu,
-                (payload->>'VL_DESP_EMPE_EDU')::NUMERIC AS valor_despesa_empenhada_edu,
-                (payload->>'VL_DESP_LIQU_EDU')::NUMERIC AS valor_despesa_liquidada_edu,
-                (payload->>'VL_DESP_PAGA_EDU')::NUMERIC AS valor_despesa_paga_edu,
-                
-                -- Indicadores e Metodologias
-                payload->>'IDN_POSS_CERT_TC' AS possui_certidao_tc,
-                payload->>'IDN_POSS_DECI_JUDI' AS possui_decisao_judicial,
-                payload->>'IDN_METO_SIOPE_IGUA_TC' AS meto_siope_igual_tc,
-                payload->>'IDN_METO_LIMI_CONS' AS meto_limite_constitucional,
-                payload->>'IDN_ASSU_RESP_MTDO_APUR' AS assumiu_resp_metodo_apuracao,
-                payload->>'DES_DIFE_METO_CALC' AS desc_diferenca_metodo_calculo,
-                payload->>'DES_JUST_PROB_BALA' AS desc_justificativa_problema_balanco,
-                
-                -- Notas de Rodapé
-                payload->>'DS_NOTA_RODAPE_RREO' AS nota_rodape_rreo,
-                payload->>'DS_NOTA_RODAPE_FUNDEB' AS nota_rodape_fundeb,
-                
-                -- Outros
-                payload->>'COD_DIGIT' AS cod_digitador,
-                payload->>'COD_VERIFIC' AS cod_verificador,
-                (payload->>'NUM_RECI')::NUMERIC AS num_recibo,
-                (payload->>'NUM_SOLI')::NUMERIC AS num_solicitacao,
-                (payload->>'NUM_PERI')::INT AS num_periodo_payload
-
-            FROM siope_registro_raw;
+            SELECT * FROM vw_fact_siope_receita;
         """))
 
 
+# ═══════════════════════════════════════════════════════════════
+# UPSERT DIMENSÕES: MUNICÍPIO E ESCOLA
+# ═══════════════════════════════════════════════════════════════
 
-
-# ======== UPSERT DIMENSÕES ========
 def upsert_municipios_from_df(df: pd.DataFrame):
     if df is None or df.empty:
         return
+    # aceita tanto colunas originais quanto nomes de view
     cols_map = {
-        "CO_MUNICIPIO": "cod_municipio",
-        "NO_MUNICIPIO": "nome",
-        "SG_UF": "uf",
+        "CO_MUNICIPIO": "cod_municipio", "Código do Município": "cod_municipio",
+        "NO_MUNICIPIO": "nome", "Nome do Município": "nome",
+        "SG_UF": "uf", "UF": "uf",
     }
-    miss = [c for c in cols_map if c not in df.columns]
-    if miss:
+    src_cols = [c for c in cols_map if c in df.columns]
+    if not src_cols:
         return
-    dfu = df[["CO_MUNICIPIO", "NO_MUNICIPIO", "SG_UF"]].drop_duplicates()
+
+    # detecta quais colunas fonte existem
+    has_cod = "CO_MUNICIPIO" in df.columns or "Código do Município" in df.columns
+    has_nom = "NO_MUNICIPIO" in df.columns or "Nome do Município" in df.columns
+    has_uf  = "SG_UF" in df.columns or "UF" in df.columns
+    if not has_cod:
+        return
+
+    cod_col = "CO_MUNICIPIO" if "CO_MUNICIPIO" in df.columns else "Código do Município"
+    nom_col = "NO_MUNICIPIO" if "NO_MUNICIPIO" in df.columns else ("Nome do Município" if "Nome do Município" in df.columns else None)
+    uf_col  = "SG_UF" if "SG_UF" in df.columns else ("UF" if "UF" in df.columns else None)
+
+    subset_cols = [cod_col]
+    if nom_col: subset_cols.append(nom_col)
+    if uf_col:  subset_cols.append(uf_col)
+
+    dfu = df[subset_cols].drop_duplicates()
     rows = []
-    for a, b, c in dfu.itertuples(index=False):
-        ca = str(a) if pd.notna(a) and str(a) != "" else None
-        if not ca:
-            continue  # ignora linhas sem PK
-        rows.append((
-            ca,
-            str(b) if pd.notna(b) else None,
-            str(c) if pd.notna(c) else None,
-        ))
+    for tup in dfu.itertuples(index=False):
+        cod = _s(tup[0])
+        if not cod:
+            continue
+        # Normaliza para str(int(float(...))) para alinhar com _muni_str() usado nas fact tables
+        try:
+            cod = str(int(float(cod)))
+        except (ValueError, TypeError):
+            pass
+        nom = _s(tup[1]) if nom_col else None
+        uf  = _s(tup[2]) if uf_col else None
+        regiao = REGIOES.get(uf) if uf else None
+        rows.append((cod, nom, uf, regiao))
     if not rows:
         return
     eng = get_engine()
     sql = (
-        "INSERT INTO dim_municipio (cod_municipio, nome, uf) "
-        "VALUES (:0, :1, :2) "
-        "ON CONFLICT (cod_municipio) DO UPDATE SET nome = EXCLUDED.nome, uf = EXCLUDED.uf"
+        "INSERT INTO dim_municipio (cod_municipio, nome, uf, regiao) "
+        "VALUES (:0, :1, :2, :3) "
+        "ON CONFLICT (cod_municipio) DO UPDATE SET "
+        "nome = EXCLUDED.nome, uf = EXCLUDED.uf, regiao = EXCLUDED.regiao"
     )
     with eng.begin() as conn:
         _exec_batch(conn, sql, rows)
 
 
 def upsert_escolas_from_df(df: pd.DataFrame):
+    """Upsert dim_escola. Se df tiver TP_DEPENDENCIA/TP_LOCALIZACAO, resolve sk_dependencia/sk_localizacao."""
     if df is None or df.empty:
         return
-    miss = [c for c in ("CO_ENTIDADE", "NO_ENTIDADE", "CO_MUNICIPIO") if c not in df.columns]
-    if miss:
+    # colunas fonte possíveis
+    cod_col = next((c for c in ("CO_ENTIDADE", "Código da Escola") if c in df.columns), None)
+    nom_col = next((c for c in ("NO_ENTIDADE", "Nome da Escola") if c in df.columns), None)
+    muni_col = next((c for c in ("CO_MUNICIPIO", "Código do Município") if c in df.columns), None)
+    dep_col = next((c for c in ("TP_DEPENDENCIA", "Dependência Administrativa") if c in df.columns), None)
+    loc_col = next((c for c in ("TP_LOCALIZACAO", "Localização") if c in df.columns), None)
+
+    if not cod_col:
         return
-    dfu = df[["CO_ENTIDADE", "NO_ENTIDADE", "CO_MUNICIPIO"]].drop_duplicates()
+
+    dfu = df[[c for c in (cod_col, nom_col, muni_col, dep_col, loc_col) if c]].drop_duplicates()
+
+    # resolve sk_dependencia e sk_localizacao se as colunas existirem
+    dep_lookup = _resolve_dep_lookup() if dep_col else {}
+    loc_lookup = _resolve_loc_lookup() if loc_col else {}
+
     rows = []
-    for a, b, c in dfu.itertuples(index=False):
-        ce = str(a) if pd.notna(a) and str(a) != "" else None
+    for tup in dfu.itertuples(index=False):
+        idx = 0
+        ce = _s(tup[idx]); idx += 1
         if not ce:
-            continue  # ignora linhas sem PK
-        rows.append((
-            ce,
-            str(b) if pd.notna(b) else None,
-            str(c) if pd.notna(c) else None,
-        ))
+            continue
+        nm = _s(tup[idx]) if nom_col else None; idx += 1
+        cm = _s(tup[idx]) if muni_col else None; idx += 1
+        sk_dep = dep_lookup.get(_s(tup[idx]).upper().strip() if dep_col and pd.notna(tup[idx]) else "", None) if dep_col else None; idx += 1
+        sk_loc = loc_lookup.get(_s(tup[idx]).upper().strip() if loc_col and pd.notna(tup[idx]) else "", None) if loc_col else None; idx += 1
+        rows.append((ce, nm, cm, sk_dep, sk_loc))
+
     if not rows:
         return
     eng = get_engine()
     sql = (
-        "INSERT INTO dim_escola (cod_escola, nome, cod_municipio) "
-        "VALUES (:0, :1, :2) "
-        "ON CONFLICT (cod_escola) DO UPDATE SET nome = EXCLUDED.nome, cod_municipio = EXCLUDED.cod_municipio"
+        "INSERT INTO dim_escola (cod_escola, nome, cod_municipio, sk_dependencia, sk_localizacao) "
+        "VALUES (:0, :1, :2, :3, :4) "
+        "ON CONFLICT (cod_escola) DO UPDATE SET "
+        "nome = EXCLUDED.nome, cod_municipio = EXCLUDED.cod_municipio, "
+        "sk_dependencia = EXCLUDED.sk_dependencia, sk_localizacao = EXCLUDED.sk_localizacao"
     )
     with eng.begin() as conn:
         _exec_batch(conn, sql, rows)
 
 
-# ======== INSERÇÃO DE FATO ========
+# ═══════════════════════════════════════════════════════════════
+# RESOLUÇÃO DE CHAVES SURROGADAS (em memória, com cache)
+# ═══════════════════════════════════════════════════════════════
+
+def _resolve_sk(lookup: dict, raw_value, fallback=None):
+    if raw_value is None:
+        return fallback
+    key = str(raw_value).strip().upper()
+    return lookup.get(key, fallback)
+
+
+def _resolve_dep_lookup():
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT cod_dependencia, sk_dependencia FROM dim_dependencia")).fetchall()
+    return {r[0].upper().strip(): r[1] for r in rows}
+
+
+def _resolve_loc_lookup():
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT cod_localizacao, sk_localizacao FROM dim_localizacao")).fetchall()
+    return {r[0].upper().strip(): r[1] for r in rows}
+
+
+def _resolve_tempo(ano):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT ano, sk_tempo FROM dim_tempo")).fetchall()
+    lookup = {r[0]: r[1] for r in rows}
+    if ano in lookup:
+        return lookup[ano]
+    with eng.begin() as conn:
+        r = conn.execute(text("INSERT INTO dim_tempo (ano) VALUES (:a) RETURNING sk_tempo"), {"a": int(ano)}).fetchone()
+        return r[0]
+
+
+def _resolve_grupo_medida(grupo, etapa):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT grupo, etapa, sk_grupo_medida FROM dim_grupo_medida")).fetchall()
+    lookup = {(r[0], r[1]): r[2] for r in rows}
+    key = (_s(grupo), _s(etapa))
+    if key in lookup:
+        return lookup[key]
+    with eng.begin() as conn:
+        r = conn.execute(
+            text("INSERT INTO dim_grupo_medida (grupo, etapa) VALUES (:g, :e) RETURNING sk_grupo_medida"),
+            {"g": _s(grupo), "e": _s(etapa)}
+        ).fetchone()
+        return r[0]
+
+
+def _resolve_grupo_infra(grupo_infra):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT grupo_infra, sk_grupo_infra FROM dim_grupo_infra")).fetchall()
+    lookup = {r[0].upper().strip(): r[1] for r in rows}
+    key = _s(grupo_infra)
+    if key and key.upper().strip() in lookup:
+        return lookup[key.upper().strip()]
+    with eng.begin() as conn:
+        r = conn.execute(
+            text("INSERT INTO dim_grupo_infra (grupo_infra) VALUES (:g) RETURNING sk_grupo_infra"),
+            {"g": key}
+        ).fetchone()
+        return r[0]
+
+
+def _resolve_categoria_indigena(categoria):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT categoria, sk_categoria_indigena FROM dim_categoria_indigena")).fetchall()
+    lookup = {r[0].upper().strip(): r[1] for r in rows}
+    key = _s(categoria)
+    if key and key.upper().strip() in lookup:
+        return lookup[key.upper().strip()]
+    with eng.begin() as conn:
+        r = conn.execute(
+            text("INSERT INTO dim_categoria_indigena (categoria) VALUES (:c) RETURNING sk_categoria_indigena"),
+            {"c": key}
+        ).fetchone()
+        return r[0]
+
+
+def _resolve_metrica(metrica):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT metrica, sk_metrica FROM dim_metrica")).fetchall()
+    lookup = {r[0].upper().strip(): r[1] for r in rows}
+    key = _s(metrica)
+    if key and key.upper().strip() in lookup:
+        return lookup[key.upper().strip()]
+    with eng.begin() as conn:
+        r = conn.execute(
+            text("INSERT INTO dim_metrica (metrica) VALUES (:m) RETURNING sk_metrica"),
+            {"m": key}
+        ).fetchone()
+        return r[0]
+
+
+def _resolve_tipo_receita(cod_receita):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT cod_receita, sk_tipo_receita FROM dim_tipo_receita")).fetchall()
+    lookup = {r[0].upper().strip(): r[1] for r in rows}
+    key = _s(cod_receita)
+    if key and key.upper().strip() in lookup:
+        return lookup[key.upper().strip()]
+    with eng.begin() as conn:
+        r = conn.execute(
+            text("INSERT INTO dim_tipo_receita (cod_receita) VALUES (:c) RETURNING sk_tipo_receita"),
+            {"c": key}
+        ).fetchone()
+        return r[0]
+
+
+def _resolve_tipo_despesa(cod_despesa):
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(text("SELECT cod_despesa, sk_tipo_despesa FROM dim_tipo_despesa")).fetchall()
+    lookup = {r[0].upper().strip(): r[1] for r in rows}
+    key = _s(cod_despesa)
+    if key and key.upper().strip() in lookup:
+        return lookup[key.upper().strip()]
+    with eng.begin() as conn:
+        r = conn.execute(
+            text("INSERT INTO dim_tipo_despesa (cod_despesa) VALUES (:c) RETURNING sk_tipo_despesa"),
+            {"c": key}
+        ).fetchone()
+        return r[0]
+
+
+def load_all_lookups(anos=None):
+    """Carrega todos os lookup tables em memória para resolução em lote.
+
+    Se *anos* for informado, insere automaticamente os anos faltantes em
+    ``dim_tempo`` antes de ler o lookup.
+    """
+    eng = get_engine()
+    lookups = {}
+    with eng.begin() as conn:
+        for table, key_col, val_col in [
+            ("dim_grupo_infra", "grupo_infra", "sk_grupo_infra"),
+            ("dim_categoria_indigena", "categoria", "sk_categoria_indigena"),
+            ("dim_metrica", "metrica", "sk_metrica"),
+            ("dim_tipo_receita", "cod_receita", "sk_tipo_receita"),
+            ("dim_tipo_despesa", "cod_despesa", "sk_tipo_despesa"),
+        ]:
+            rows = conn.execute(text(f"SELECT {key_col}, {val_col} FROM {table}")).fetchall()
+            lookups[table] = {r[0].upper().strip(): r[1] for r in rows}
+
+        # dim_grupo_medida: chaves compostas (grupo, etapa)
+        rows = conn.execute(text("SELECT grupo, etapa, sk_grupo_medida FROM dim_grupo_medida")).fetchall()
+        lookups["dim_grupo_medida"] = {(r[0], r[1]): r[2] for r in rows}
+
+        # dim_tempo: garante que todos os anos necessários existam
+        if anos:
+            for ano in sorted(set(a for a in anos if a is not None)):
+                conn.execute(text(
+                    "INSERT INTO dim_tempo (ano) VALUES (:a) ON CONFLICT (ano) DO NOTHING"
+                ), {"a": int(ano)})
+        rows = conn.execute(text("SELECT ano, sk_tempo FROM dim_tempo")).fetchall()
+        lookups["dim_tempo"] = {r[0]: r[1] for r in rows}
+
+        # dim_dependencia (por cod_dependencia)
+        rows = conn.execute(text("SELECT cod_dependencia, sk_dependencia FROM dim_dependencia")).fetchall()
+        lookups["dim_dependencia"] = {r[0].upper().strip(): r[1] for r in rows}
+
+        # dim_localizacao (por cod_localizacao)
+        rows = conn.execute(text("SELECT cod_localizacao, sk_localizacao FROM dim_localizacao")).fetchall()
+        lookups["dim_localizacao"] = {r[0].upper().strip(): r[1] for r in rows}
+
+    return lookups
+
+
+def _resolve_sk_bulk(lookup: dict, raw_value, fallback=None):
+    if raw_value is None:
+        return fallback
+    key = str(raw_value).strip().upper()
+    return lookup.get(key, fallback)
+
+
+# ═══════════════════════════════════════════════════════════════
+# INSERÇÃO DE FATOS
+# ═══════════════════════════════════════════════════════════════
+
 def insert_censo_medidas(df_long: pd.DataFrame):
     if df_long is None or df_long.empty:
         return
-    req = [
-        "NU_ANO_CENSO", "SG_UF", "CO_MUNICIPIO", "NO_MUNICIPIO",
-        "TP_DEPENDENCIA", "TP_LOCALIZACAO", "CO_ENTIDADE", "NO_ENTIDADE",
-        "Grupo", "Etapa", "QT",
-    ]
+    req = ["NU_ANO_CENSO", "CO_ENTIDADE", "Grupo", "Etapa", "QT"]
     miss = [c for c in req if c not in df_long.columns]
     if miss:
         return
-    dfu = df_long[req].copy()
-    rows = [
-        (
-            int(a) if pd.notna(a) else None,
-            str(b) if pd.notna(b) else None,
-            str(c) if pd.notna(c) else None,
-            str(d) if pd.notna(d) else None,
-            str(e) if pd.notna(e) else None,
-            str(f) if pd.notna(f) else None,
-            str(g) if pd.notna(g) else None,
-            str(h) if pd.notna(h) else None,
-            str(i) if pd.notna(i) else None,
-            str(j) if pd.notna(j) else None,
-            int(k) if (pd.notna(k) and k != "") else None,
-        )
-        for a, b, c, d, e, f, g, h, i, j, k in dfu.itertuples(index=False)
-    ]
+
+    anos = [_i(x) for x in df_long["NU_ANO_CENSO"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+    gm_lookup = lookups["dim_grupo_medida"]
+
+    rows = []
+    for _, row in df_long.iterrows():
+        ano = _i(row.get("NU_ANO_CENSO"))
+        cod_escola = _s(row.get("CO_ENTIDADE"))
+        grupo = _s(row.get("Grupo"))
+        etapa = _s(row.get("Etapa"))
+        qt = _i(row.get("QT"))
+        if not all([ano, cod_escola, grupo, etapa, qt is not None]):
+            continue
+
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        sk_gm = gm_lookup.get((grupo, etapa))
+        if sk_gm is None:
+            continue
+
+        rows.append((sk_tempo, cod_escola, sk_gm, qt))
+
+    if not rows:
+        return
     eng = get_engine()
     sql = (
-        "INSERT INTO fact_censo_medida (ano, uf, cod_municipio, nome_municipio, tp_dependencia, tp_localizacao, "
-        "cod_escola, nome_escola, grupo, etapa, qt) VALUES "
-        "(:0,:1,:2,:3,:4,:5,:6,:7,:8,:9,:10) "
-        "ON CONFLICT (ano, cod_escola, grupo, etapa) DO UPDATE SET qt = EXCLUDED.qt, "
-        "uf=EXCLUDED.uf, cod_municipio=EXCLUDED.cod_municipio, nome_municipio=EXCLUDED.nome_municipio, "
-        "tp_dependencia=EXCLUDED.tp_dependencia, tp_localizacao=EXCLUDED.tp_localizacao, nome_escola=EXCLUDED.nome_escola"
+        "INSERT INTO fact_censo_medida (sk_tempo, cod_escola, sk_grupo_medida, qt) "
+        "VALUES (:0, :1, :2, :3) "
+        "ON CONFLICT (sk_tempo, cod_escola, sk_grupo_medida) DO UPDATE SET qt = EXCLUDED.qt"
     )
     with eng.begin() as conn:
         _exec_batch(conn, sql, rows)
@@ -498,42 +1035,43 @@ def insert_censo_medidas(df_long: pd.DataFrame):
 def insert_infra_escola(df_long: pd.DataFrame):
     if df_long is None or df_long.empty:
         return
-    req = [
-        "NU_ANO_CENSO","SG_UF","CO_MUNICIPIO","NO_MUNICIPIO",
-        "TP_DEPENDENCIA","REDE_TIPO","TP_LOCALIZACAO","LOCALIZACAO_TIPO",
-        "CO_ENTIDADE","NO_ENTIDADE","GrupoInfra","Item","POSSUI"
-    ]
+    req = ["NU_ANO_CENSO", "CO_ENTIDADE", "GrupoInfra", "Item", "POSSUI"]
     miss = [c for c in req if c not in df_long.columns]
     if miss:
         return
-    dfu = df_long[req].copy()
-    rows = [
-        (
-            int(a) if pd.notna(a) else None,
-            str(b) if pd.notna(b) else None,
-            str(c) if pd.notna(c) else None,
-            str(d) if pd.notna(d) else None,
-            str(e) if pd.notna(e) else None,
-            str(f) if pd.notna(f) else None,
-            str(g) if pd.notna(g) else None,
-            str(h) if pd.notna(h) else None,
-            str(i) if pd.notna(i) else None,
-            str(j) if pd.notna(j) else None,
-            str(k) if pd.notna(k) else None,
-            str(l) if pd.notna(l) else None,
-            int(m) if pd.notna(m) else None,
-        )
-        for a,b,c,d,e,f,g,h,i,j,k,l,m in dfu.itertuples(index=False)
-    ]
+
+    anos = [_i(x) for x in df_long["NU_ANO_CENSO"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+    gi_lookup = lookups["dim_grupo_infra"]
+
+    rows = []
+    for _, row in df_long.iterrows():
+        ano = _i(row.get("NU_ANO_CENSO"))
+        cod_escola = _s(row.get("CO_ENTIDADE"))
+        grupo_infra = _s(row.get("GrupoInfra"))
+        item = _s(row.get("Item"))
+        possui = _i(row.get("POSSUI"))
+        if not all([ano, cod_escola, grupo_infra, item, possui is not None]):
+            continue
+
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        sk_gi = gi_lookup.get(grupo_infra.upper().strip() if grupo_infra else "")
+        if sk_gi is None:
+            continue
+
+        rows.append((sk_tempo, cod_escola, sk_gi, item, int(possui)))
+
+    if not rows:
+        return
     eng = get_engine()
     sql = (
-        "INSERT INTO fact_infra_escola (ano, uf, cod_municipio, nome_municipio, tp_dependencia, rede_tipo, tp_localizacao, localizacao_tipo, "
-        "cod_escola, nome_escola, grupo_infra, item, possui) VALUES "
-        "(:0,:1,:2,:3,:4,:5,:6,:7,:8,:9,:10,:11,:12) "
-        "ON CONFLICT (ano, cod_escola, item) DO UPDATE SET possui = EXCLUDED.possui, "
-        "uf=EXCLUDED.uf, cod_municipio=EXCLUDED.cod_municipio, nome_municipio=EXCLUDED.nome_municipio, "
-        "tp_dependencia=EXCLUDED.tp_dependencia, rede_tipo=EXCLUDED.rede_tipo, tp_localizacao=EXCLUDED.tp_localizacao, "
-        "localizacao_tipo=EXCLUDED.localizacao_tipo, nome_escola=EXCLUDED.nome_escola, grupo_infra=EXCLUDED.grupo_infra"
+        "INSERT INTO fact_infra_escola (sk_tempo, cod_escola, sk_grupo_infra, item, possui) "
+        "VALUES (:0, :1, :2, :3, :4) "
+        "ON CONFLICT (sk_tempo, cod_escola, item) DO UPDATE SET "
+        "sk_grupo_infra = EXCLUDED.sk_grupo_infra, possui = EXCLUDED.possui"
     )
     with eng.begin() as conn:
         _exec_batch(conn, sql, rows)
@@ -542,39 +1080,47 @@ def insert_infra_escola(df_long: pd.DataFrame):
 def insert_indigena(df_long: pd.DataFrame):
     if df_long is None or df_long.empty:
         return
-    req = [
-        "NU_ANO_CENSO","SG_UF","CO_MUNICIPIO","NO_MUNICIPIO",
-        "TP_DEPENDENCIA","TP_LOCALIZACAO","CO_ENTIDADE","NO_ENTIDADE",
-        "CategoriaIndigena","Grupo","Etapa","QT"
-    ]
+    req = ["NU_ANO_CENSO", "CO_ENTIDADE", "CategoriaIndigena", "Grupo", "Etapa", "QT"]
     miss = [c for c in req if c not in df_long.columns]
     if miss:
         return
-    dfu = df_long[req].copy()
+
+    anos = [_i(x) for x in df_long["NU_ANO_CENSO"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+    gm_lookup = lookups["dim_grupo_medida"]
+    ci_lookup = lookups["dim_categoria_indigena"]
+
     rows = []
-    for a,b,c,d,e,f,g,h,i,j,k,l in dfu.itertuples(index=False):
-        rows.append((
-            int(a) if pd.notna(a) else None,
-            str(b) if pd.notna(b) else None,
-            str(c) if pd.notna(c) else None,
-            str(d) if pd.notna(d) else None,
-            str(e) if pd.notna(e) else None,
-            str(f) if pd.notna(f) else None,
-            str(g) if pd.notna(g) else None,
-            str(h) if pd.notna(h) else None,
-            str(i) if pd.notna(i) else None,
-            str(j) if pd.notna(j) else None,
-            str(k) if pd.notna(k) else None,
-            int(l) if pd.notna(l) else None,
-        ))
+    for _, row in df_long.iterrows():
+        ano = _i(row.get("NU_ANO_CENSO"))
+        cod_escola = _s(row.get("CO_ENTIDADE"))
+        categoria = _s(row.get("CategoriaIndigena"))
+        grupo = _s(row.get("Grupo"))
+        etapa = _s(row.get("Etapa"))
+        qt = _i(row.get("QT"))
+        if not all([ano, cod_escola, categoria, grupo, etapa, qt is not None]):
+            continue
+
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        sk_ci = ci_lookup.get(categoria.upper().strip() if categoria else "")
+        if sk_ci is None:
+            continue
+        sk_gm = gm_lookup.get((grupo, etapa))
+        if sk_gm is None:
+            continue
+
+        rows.append((sk_tempo, cod_escola, sk_ci, sk_gm, qt))
+
+    if not rows:
+        return
     eng = get_engine()
     sql = (
-        "INSERT INTO fact_indigena (ano, uf, cod_municipio, nome_municipio, tp_dependencia, tp_localizacao, "
-        "cod_escola, nome_escola, categoria, grupo, etapa, qt) VALUES "
-        "(:0,:1,:2,:3,:4,:5,:6,:7,:8,:9,:10,:11) "
-        "ON CONFLICT (ano, cod_escola, categoria, grupo, etapa) DO UPDATE SET qt = EXCLUDED.qt, "
-        "uf=EXCLUDED.uf, cod_municipio=EXCLUDED.cod_municipio, nome_municipio=EXCLUDED.nome_municipio, "
-        "tp_dependencia=EXCLUDED.tp_dependencia, tp_localizacao=EXCLUDED.tp_localizacao, nome_escola=EXCLUDED.nome_escola"
+        "INSERT INTO fact_indigena (sk_tempo, cod_escola, sk_categoria_indigena, sk_grupo_medida, qt) "
+        "VALUES (:0, :1, :2, :3, :4) "
+        "ON CONFLICT (sk_tempo, cod_escola, sk_categoria_indigena, sk_grupo_medida) DO UPDATE SET qt = EXCLUDED.qt"
     )
     with eng.begin() as conn:
         _exec_batch(conn, sql, rows)
@@ -583,74 +1129,84 @@ def insert_indigena(df_long: pd.DataFrame):
 def insert_tx_rendimento(df_long: pd.DataFrame):
     if df_long is None or df_long.empty:
         return
-    # Aceita colunas parciais; preenche None quando ausentes.
+
+    anos = [_i(x) for x in df_long["Ano"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+    met_lookup = lookups["dim_metrica"]
+
     cols = {
         "ano": "Ano",
-        "regiao": "Região",
-        "uf": "UF",
-        "cod_municipio": "Código do Município",
-        "nome_municipio": "Nome do Município",
-        "cod_escola": "Código da Escola",
-        "nome_escola": "Nome da Escola",
-        "localizacao": "Localização",
-        "dependencia": "Dependência Administrativa",
+        "metrica": "Métrica",
         "etapa": "Etapa",
         "serie": "Serie",
-        "metrica": "Métrica",
         "valor": "Valor",
         "valor_num": "Valor_num",
         "valor_prop": "Valor_prop",
     }
-    recs = df_long.to_dict(orient="records")
+    cod_col = "Código da Escola"
+    muni_col = next((c for c in ("Código do Município",) if c in df_long.columns), None)
+
     rows = []
-    for r in recs:
-        def g(key):
-            col = cols[key]
-            return r.get(col, None)
-        rows.append((
-            _to_int_or_none(g("ano")),
-            (str(g("regiao")) if pd.notna(g("regiao")) else None),
-            (str(g("uf")) if pd.notna(g("uf")) else None),
-            (str(g("cod_municipio")) if pd.notna(g("cod_municipio")) else None),
-            (str(g("nome_municipio")) if pd.notna(g("nome_municipio")) else None),
-            (str(g("cod_escola")) if (pd.notna(g("cod_escola")) and str(g("cod_escola")) != "") else None),
-            (str(g("nome_escola")) if (pd.notna(g("nome_escola")) and str(g("nome_escola")) != "") else None),
-            (str(g("localizacao")) if pd.notna(g("localizacao")) else None),
-            (str(g("dependencia")) if pd.notna(g("dependencia")) else None),
-            (str(g("etapa")) if pd.notna(g("etapa")) else None),
-            _to_int_or_none(g("serie")),
-            (str(g("metrica")) if pd.notna(g("metrica")) else None),
-            (str(g("valor")) if pd.notna(g("valor")) else None),
-            _to_float_or_none(g("valor_num")),
-            _to_float_or_none(g("valor_prop")),
-        ))
+    for _, row in df_long.iterrows():
+        ano = _i(row.get(cols["ano"]))
+        cod_muni = _s(row.get(muni_col)) if muni_col else None
+        if cod_muni:
+            try:
+                cod_muni = str(int(float(cod_muni)))
+            except (ValueError, TypeError):
+                pass
+        cod_escola = _s(row.get(cod_col)) if cod_col in df_long.columns else None
+        if not cod_escola:
+            cod_escola = ""
+        metrica = _s(row.get(cols["metrica"]))
+        etapa = _s(row.get(cols["etapa"]))
+        serie = _i(row.get(cols["serie"]))
+        if serie is None:
+            serie = 0
+        valor = _s(row.get(cols["valor"]))
+        valor_num = _to_float_or_none(row.get(cols["valor_num"]))
+        valor_prop = _to_float_or_none(row.get(cols["valor_prop"]))
+
+        if not all([ano, metrica]):
+            continue
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        sk_met = met_lookup.get(metrica.upper().strip() if metrica else "")
+        if sk_met is None:
+            continue
+
+        rows.append((sk_tempo, cod_muni, cod_escola, sk_met, etapa, serie, valor, valor_num, valor_prop))
+
+    if not rows:
+        return
     eng = get_engine()
     sql = (
-        "INSERT INTO fact_tx_rendimento (ano, regiao, uf, cod_municipio, nome_municipio, cod_escola, nome_escola, "
-        "localizacao, dependencia, etapa, serie, metrica, valor, valor_num, valor_prop) VALUES "
-        "(:0,:1,:2,:3,:4,:5,:6,:7,:8,:9,:10,:11,:12,:13,:14) "
-        "ON CONFLICT (ano, uf, cod_municipio, cod_escola, etapa, serie, metrica) DO UPDATE SET "
-        "valor = EXCLUDED.valor, valor_num = EXCLUDED.valor_num, valor_prop = EXCLUDED.valor_prop, "
-        "regiao=EXCLUDED.regiao, nome_municipio=EXCLUDED.nome_municipio, nome_escola=EXCLUDED.nome_escola, "
-        "localizacao=EXCLUDED.localizacao, dependencia=EXCLUDED.dependencia"
+        "INSERT INTO fact_tx_rendimento (sk_tempo, cod_municipio, cod_escola, sk_metrica, etapa, serie, valor, valor_num, valor_prop) "
+        "VALUES (:0, :1, :2, :3, :4, :5, :6, :7, :8) "
+        "ON CONFLICT (sk_tempo, cod_municipio, cod_escola, sk_metrica, etapa, serie) DO UPDATE SET "
+        "valor = EXCLUDED.valor, valor_num = EXCLUDED.valor_num, valor_prop = EXCLUDED.valor_prop"
     )
     with eng.begin() as conn:
         _exec_batch(conn, sql, rows)
 
 
+# ═══════════════════════════════════════════════════════════════
+# SIOPE: JSONB → FATOS ESTRUTURADOS
+# ═══════════════════════════════════════════════════════════════
+
 def insert_siope_raw(df: pd.DataFrame):
+    """Insere SIOPE JSONB bruto (mantido para retrocompatibilidade)."""
     if df is None or df.empty:
         return
-    # colunas usuais se existirem
-    has = {c: c in df.columns for c in ["NUM_ANO","NUM_PERI","SIG_UF","COD_MUNI","PERIODO_LABEL"]}
-    # prepara rows como dicts nomeados + json payload (string)
+    has = {c: c in df.columns for c in ["NUM_ANO", "NUM_PERI", "SIG_UF", "COD_MUNI", "PERIODO_LABEL"]}
+
     def _muni_str(v):
         if v is None or (isinstance(v, float) and math.isnan(v)):
             return None
         try:
-            # remove .0 quando vier float
-            iv = int(float(v))
-            return str(iv)
+            return str(int(float(v)))
         except Exception:
             return str(v)
 
@@ -662,7 +1218,6 @@ def insert_siope_raw(df: pd.DataFrame):
             "sig_uf": str(row["SIG_UF"]) if has["SIG_UF"] and pd.notna(row["SIG_UF"]) else None,
             "cod_muni": _muni_str(row["COD_MUNI"]) if has["COD_MUNI"] else None,
             "periodo_label": str(row["PERIODO_LABEL"]) if has["PERIODO_LABEL"] and pd.notna(row["PERIODO_LABEL"]) else None,
-            # envia como estrutura Python para adaptação JSON via SQLAlchemy
             "payload": json.loads(row.to_json()),
         })
     eng = get_engine()
@@ -673,3 +1228,201 @@ def insert_siope_raw(df: pd.DataFrame):
     with eng.begin() as conn:
         stmt = text(sql).bindparams(bindparam("payload", type_=JSON))
         _exec_batch(conn, stmt, rows, chunk=1000)
+
+
+def insert_siope_receita(df: pd.DataFrame):
+    """Extrai receitas do DataFrame SIOPE → fact_siope_receita."""
+    if df is None or df.empty:
+        return
+
+    anos = [_i(x) for x in df["NUM_ANO"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+    rec_lookup = lookups["dim_tipo_receita"]
+
+    def _muni_str(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return str(v) if str(v).strip() else None
+
+    def _num(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    ano_col = next((c for c in ("NUM_ANO",) if c in df.columns), None)
+    muni_col = next((c for c in ("COD_MUNI",) if c in df.columns), None)
+    if not ano_col or not muni_col:
+        return
+
+    rows = []
+    for _, row in df.iterrows():
+        ano = _i(row.get(ano_col))
+        if ano is None:
+            continue
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        cod_muni = _muni_str(row.get(muni_col))
+        if not cod_muni:
+            continue
+
+        for json_key, cod_receita in SIOPE_RECEITA_KEYS.items():
+            val = _num(row.get(json_key))
+            if val is None:
+                continue
+            sk = rec_lookup.get(cod_receita)
+            if sk is None:
+                continue
+            rows.append((sk_tempo, cod_muni, sk, val))
+
+    if not rows:
+        return
+    eng = get_engine()
+    sql = (
+        "INSERT INTO fact_siope_receita (sk_tempo, cod_municipio, sk_tipo_receita, valor) "
+        "VALUES (:0, :1, :2, :3) "
+        "ON CONFLICT (sk_tempo, cod_municipio, sk_tipo_receita) DO UPDATE SET valor = EXCLUDED.valor"
+    )
+    with eng.begin() as conn:
+        _exec_batch(conn, sql, rows)
+
+
+def insert_siope_despesa(df: pd.DataFrame):
+    """Extrai despesas do DataFrame SIOPE → fact_siope_despesa."""
+    if df is None or df.empty:
+        return
+
+    anos = [_i(x) for x in df["NUM_ANO"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+    desp_lookup = lookups["dim_tipo_despesa"]
+
+    def _muni_str(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return str(v) if str(v).strip() else None
+
+    def _num(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    ano_col = next((c for c in ("NUM_ANO",) if c in df.columns), None)
+    muni_col = next((c for c in ("COD_MUNI",) if c in df.columns), None)
+    if not ano_col or not muni_col:
+        return
+
+    rows = []
+    for _, row in df.iterrows():
+        ano = _i(row.get(ano_col))
+        if ano is None:
+            continue
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        cod_muni = _muni_str(row.get(muni_col))
+        if not cod_muni:
+            continue
+
+        for json_key, cod_despesa in SIOPE_DESPESA_KEYS.items():
+            val = _num(row.get(json_key))
+            if val is None:
+                continue
+            sk = desp_lookup.get(cod_despesa)
+            if sk is None:
+                continue
+            rows.append((sk_tempo, cod_muni, sk, val))
+
+    if not rows:
+        return
+    eng = get_engine()
+    sql = (
+        "INSERT INTO fact_siope_despesa (sk_tempo, cod_municipio, sk_tipo_despesa, valor) "
+        "VALUES (:0, :1, :2, :3) "
+        "ON CONFLICT (sk_tempo, cod_municipio, sk_tipo_despesa) DO UPDATE SET valor = EXCLUDED.valor"
+    )
+    with eng.begin() as conn:
+        _exec_batch(conn, sql, rows)
+
+
+def insert_siope_indicadores(df: pd.DataFrame):
+    """Extrai indicadores demográficos/financeiros → fact_siope_indicadores."""
+    if df is None or df.empty:
+        return
+
+    anos = [_i(x) for x in df["NUM_ANO"] if _i(x) is not None]
+    lookups = load_all_lookups(anos=anos)
+    tempo_lookup = lookups["dim_tempo"]
+
+    def _muni_str(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return str(v) if str(v).strip() else None
+
+    def _num(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    ano_col = next((c for c in ("NUM_ANO",) if c in df.columns), None)
+    muni_col = next((c for c in ("COD_MUNI",) if c in df.columns), None)
+    if not ano_col or not muni_col:
+        return
+
+    IND_FIELDS = {
+        "NUM_POPU": "populacao",
+        "VAL_PIB": "valor_pib",
+        "VAL_PIB_PERCAPTO": "valor_pib_percapto",
+    }
+
+    rows = []
+    for _, row in df.iterrows():
+        ano = _i(row.get(ano_col))
+        if ano is None:
+            continue
+        sk_tempo = tempo_lookup.get(ano)
+        if sk_tempo is None:
+            continue
+        cod_muni = _muni_str(row.get(muni_col))
+        if not cod_muni:
+            continue
+
+        populacao = _num(row.get("NUM_POPU"))
+        pib = _num(row.get("VAL_PIB"))
+        pib_perc = _num(row.get("VAL_PIB_PERCAPTO"))
+
+        if populacao is None and pib is None and pib_perc is None:
+            continue
+
+        rows.append((sk_tempo, cod_muni, populacao, pib, pib_perc))
+
+    if not rows:
+        return
+    eng = get_engine()
+    sql = (
+        "INSERT INTO fact_siope_indicadores (sk_tempo, cod_municipio, populacao, valor_pib, valor_pib_percapto) "
+        "VALUES (:0, :1, :2, :3, :4) "
+        "ON CONFLICT (sk_tempo, cod_municipio) DO UPDATE SET "
+        "populacao = EXCLUDED.populacao, valor_pib = EXCLUDED.valor_pib, valor_pib_percapto = EXCLUDED.valor_pib_percapto"
+    )
+    with eng.begin() as conn:
+        _exec_batch(conn, sql, rows)

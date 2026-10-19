@@ -1,7 +1,7 @@
 """
 load_db_from_csv.py
 Carrega arquivos CSV gerados pelo pipeline e insere no PostgreSQL via db.py.
-Usado como integração sem alterar a lógica dos módulos de normalização.
+Modelo estrela: dimensões são populadas automaticamente pelas funções insert_*.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ def carregar_censo_normalizado():
         df = pd.read_csv(config.ARQUIVO_NORMALIZADO, dtype=str)
     except FileNotFoundError:
         return 0
-    # tipa QT
     if "QT" in df.columns:
         df["QT"] = pd.to_numeric(df["QT"], errors="coerce").astype("Int64")
     db.init_db()
@@ -31,12 +30,11 @@ def carregar_infra_long():
         df = pd.read_csv(config.ARQUIVO_INFRA, dtype=str)
     except FileNotFoundError:
         return 0
-    # tipa POSSUI
     if "POSSUI" in df.columns:
         df["POSSUI"] = pd.to_numeric(df["POSSUI"], errors="coerce").fillna(0).astype("Int64")
     db.init_db()
-    db.upsert_municipios_from_df(df.rename(columns={"SG_UF":"SG_UF"}))
-    db.upsert_escolas_from_df(df.rename(columns={"CO_MUNICIPIO":"CO_MUNICIPIO"}))
+    db.upsert_municipios_from_df(df)
+    db.upsert_escolas_from_df(df)
     db.insert_infra_escola(df)
     return len(df)
 
@@ -60,20 +58,37 @@ def carregar_tx_rendimento_long():
         df = pd.read_csv(config.ARQUIVO_TX_REND_LONG, dtype=str)
     except FileNotFoundError:
         return 0
-    # tipa números
     if "Valor_num" in df.columns:
         df["Valor_num"] = pd.to_numeric(df["Valor_num"], errors="coerce")
     if "Valor_prop" in df.columns:
         df["Valor_prop"] = pd.to_numeric(df["Valor_prop"], errors="coerce")
 
     db.init_db()
-    # upsert de municípios com UF/nome quando possível
-    muni_cols = [c for c in ["Código do Município","Nome do Município","UF"] if c in df.columns]
+    # upsert de municípios
+    muni_cols = [c for c in ["Código do Município", "Nome do Município", "UF"] if c in df.columns]
     if len(muni_cols) == 3:
-        muni = df[["Código do Município","Nome do Município","UF"]].drop_duplicates()
-        muni.columns = ["CO_MUNICIPIO","NO_MUNICIPIO","SG_UF"]
+        muni = df[["Código do Município", "Nome do Município", "UF"]].drop_duplicates()
+        muni.columns = ["CO_MUNICIPIO", "NO_MUNICIPIO", "SG_UF"]
         db.upsert_municipios_from_df(muni)
 
     db.insert_tx_rendimento(df)
     return len(df)
 
+
+def carregar_siope(df_siope: pd.DataFrame):
+    """Insere dados SIOPE no modelo estrela (fatos estruturados)."""
+    if df_siope is None or df_siope.empty:
+        return 0
+    db.init_db()
+    # upsert de municípios a partir do SIOPE
+    if "COD_MUNI" in df_siope.columns and "NOM_MUNI" in df_siope.columns:
+        muni = df_siope[["COD_MUNI", "NOM_MUNI", "SIG_UF"]].drop_duplicates()
+        muni.columns = ["CO_MUNICIPIO", "NO_MUNICIPIO", "SG_UF"]
+        db.upsert_municipios_from_df(muni)
+    # insere fatos estruturados
+    db.insert_siope_receita(df_siope)
+    db.insert_siope_despesa(df_siope)
+    db.insert_siope_indicadores(df_siope)
+    # mantém raw para retrocompatibilidade
+    db.insert_siope_raw(df_siope)
+    return len(df_siope)

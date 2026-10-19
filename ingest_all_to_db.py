@@ -57,9 +57,10 @@ def step_coleta_siope():
     df = coleta_siope.coletar_siope()
     linhas = len(df) if df is not None and not df.empty else 0
     if linhas:
-        db.init_db()
-        db.insert_siope_raw(df)
-    print(f"OK SIOPE: {linhas:,} registros inseridos (siope_registro_raw)")
+        n = loader.carregar_siope(df)
+        print(f"OK SIOPE: {n:,} registros processados (fact_siope_receita, fact_siope_despesa, fact_siope_indicadores)")
+    else:
+        print("OK SIOPE: nenhum registro retornado.")
 
 
 def step_tx_rendimento():

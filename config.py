@@ -32,7 +32,7 @@ DICIONARIO_PATH = BASE_DIR / "Complementares" / "dicionário_dados_educação_b�
 # O Censo de um dado ano só é publicado no ano seguinte, por isso usamos
 # `current_year` como limite EXCLUSIVO (2010..ano_atual-1). Incluir o ano
 # atual sempre resultaria em 404 (arquivo ainda não publicado).
-CENSO_YEARS = list(range(2010, datetime.now().year))  # 2010..ano_atual-1
+CENSO_YEARS = list(range(2020, datetime.now().year))  # 2010..ano_atual-1
 CENSO_URL_TEMPLATE = [
     "https://download.inep.gov.br/dados_abertos/microdados_censo_escolar_{year}.zip",
     "https://download.inep.gov.br/dados_abertos/microdados_censo_escolar_{year}_.zip",
@@ -62,7 +62,7 @@ CENSO_TABELA_CHAVE = ["NU_ANO_CENSO", "CO_ENTIDADE"]
 # ====== SIOPE (FNDE) ======
 SIOPE_BASE = "https://www.fnde.gov.br/olinda-ide/servico/DADOS_ABERTOS_SIOPE/versao/v1/odata"
 SIOPE_RESOURCE = "Dados_Gerais_Siope"      # <- case correto do endpoint
-SIOPE_START_YEAR = 2010                    # pode ajustar
+SIOPE_START_YEAR = 2020                    # pode ajustar
 SIOPE_TIMEOUT = 60                         # <- corrigido (antes estava TIMMEOUT)
 SIOPE_SLEEP_BETWEEN = 10                   # segundos entre requisições (antes: SIOPE_SLEEP_BETWEEN_REQUESTS)
 SIOPE_PERIOD_LABEL = {1: "Jan-Fev", 2: "Mar-Abr", 3: "Mai-Jun", 4: "Jul-Ago", 5: "Set-Out", 6: "Nov-Dez"}
@@ -198,4 +198,4 @@ UPLOAD_CSV_AS_SHEET = [
     },
 ]
 
-INCLUIR_MATRICULAS_GERAIS_NO_INDIGENA = True
+INCLUIR_MATRICULAS_GERAIS_NO_INDIGENA = False

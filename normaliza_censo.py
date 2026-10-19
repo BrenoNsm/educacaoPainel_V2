@@ -207,17 +207,22 @@ def normalizar_censo():
     etapas_matriculas = {
         "Educação Especial": "QT_MAT_ESP",
         "Ed. Infantil - Creche": "QT_MAT_INF_CRE",
-        "Ed. Infantil - Creche - Tempo Integral": "QT_MAT_INF_CRE_INT",
         "Ed. Infantil - Pré-Escola": "QT_MAT_INF_PRE",
-        "Ed. Infantil - Pré-Escola - Tempo Integral": "QT_MAT_INF_PRE_INT",
         "Ensino Fund. - Anos Iniciais": "QT_MAT_FUND_AI",
-        "Ensino Fund. - Anos Iniciais - Tempo Integral": "QT_MAT_FUND_AI_INT",
         "Ensino Fund. - Anos Finais": "QT_MAT_FUND_AF",
-        "Ensino Fund. - Anos Finais - Tempo Integral": "QT_MAT_FUND_AF_INT",
         "Ensino Médio": "QT_MAT_MED",
-        "Ensino Médio - Tempo Integral": "QT_MAT_MED_INT",
         "EJA - Ensino Fundamental": "QT_MAT_EJA_FUND",
         "EJA - Ensino Médio": "QT_MAT_EJA_MED",
+    }
+
+    # Tempo Integral é SUBCONJUNTO das matrículas totais de cada etapa.
+    # Grupo próprio para que SUM(QT) no Grupo "Matrículas" retorne o total correto.
+    etapas_matriculas_ti = {
+        "Ed. Infantil - Creche": "QT_MAT_INF_CRE_INT",
+        "Ed. Infantil - Pré-Escola": "QT_MAT_INF_PRE_INT",
+        "Ensino Fund. - Anos Iniciais": "QT_MAT_FUND_AI_INT",
+        "Ensino Fund. - Anos Finais": "QT_MAT_FUND_AF_INT",
+        "Ensino Médio": "QT_MAT_MED_INT",
     }
 
     etapas_turmas = {
@@ -253,6 +258,7 @@ def normalizar_censo():
 
     # --- Matrículas e Turmas ---
     mat_long = expandir_grupo(df_final, etapas_matriculas, "Matrículas", "QT")
+    mat_ti_long = expandir_grupo(df_final, etapas_matriculas_ti, "Matrículas - Tempo Integral", "QT")
     tur_long = expandir_grupo(df_final, etapas_turmas, "Turmas", "QT")
 
     # --- Docentes: total geral ---
@@ -336,15 +342,20 @@ def normalizar_censo():
     # ==========================
     dfs_long = [
         selecionar_cols(mat_long),
+        selecionar_cols(mat_ti_long),
         selecionar_cols(tur_long),
-        selecionar_cols(doc_total_long),
     ]
 
-    # inclui docentes por etapa reais/estimados conforme disponível
-    if not doc_por_etapa_reais.empty:
-        dfs_long.append(selecionar_cols(doc_por_etapa_reais))
-    elif not doc_por_etapa_estimado.empty:
-        dfs_long.append(selecionar_cols(doc_por_etapa_estimado))
+    # Docentes: OU o total geral, OU o detalhamento por etapa, nunca os dois
+    # (o detalhamento soma exatamente ao total => evitaria duplicação).
+    tem_doc_por_etapa = (not doc_por_etapa_reais.empty) or (not doc_por_etapa_estimado.empty)
+    if tem_doc_por_etapa:
+        if not doc_por_etapa_reais.empty:
+            dfs_long.append(selecionar_cols(doc_por_etapa_reais))
+        elif not doc_por_etapa_estimado.empty:
+            dfs_long.append(selecionar_cols(doc_por_etapa_estimado))
+    else:
+        dfs_long.append(selecionar_cols(doc_total_long))
 
     df_norm = pd.concat([d for d in dfs_long if not d.empty], ignore_index=True)
 

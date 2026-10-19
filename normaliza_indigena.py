@@ -509,13 +509,26 @@ def normalizar_indigena():
         selecionar_cols(mat_indigena_etapas(mask_cat_escola, "Escola Indígena")),
         selecionar_cols(mat_indigena_etapas(mask_cat_terra,  "Em Terra Indígena")),
         selecionar_cols(mat_indigena_etapas(mask_cat_lingua, "Com Língua Indígena")),
-        selecionar_cols(doc_tot_escola), selecionar_cols(doc_tot_terra), selecionar_cols(doc_tot_lingua),
     ]
 
-    for df_x in [doc_reais_escola, doc_reais_terra, doc_reais_lingua,
-                 doc_est_escola,  doc_est_terra,  doc_est_lingua]:
-        if df_x is not None and not df_x.empty:
-            dfs_indig.append(selecionar_cols(df_x))
+    # Docentes: OU o total geral, OU o detalhamento por etapa, nunca os dois
+    # (o detalhamento soma exatamente ao total => evitaria duplicação).
+    doc_por_etapa_indig = [
+        doc_reais_escola, doc_reais_terra, doc_reais_lingua,
+        doc_est_escola,   doc_est_terra,   doc_est_lingua,
+    ]
+    tem_doc_por_etapa_indig = any(
+        d is not None and not d.empty for d in doc_por_etapa_indig
+    )
+
+    if tem_doc_por_etapa_indig:
+        for df_x in doc_por_etapa_indig:
+            if df_x is not None and not df_x.empty:
+                dfs_indig.append(selecionar_cols(df_x))
+    else:
+        dfs_indig += [
+            selecionar_cols(doc_tot_escola), selecionar_cols(doc_tot_terra), selecionar_cols(doc_tot_lingua),
+        ]
 
     # (opcional) incluir matrículas gerais? (default False para evitar confusão)
     if INCLUIR_MATRICULAS_GERAIS_NO_INDIGENA:
